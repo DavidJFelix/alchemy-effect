@@ -1,9 +1,15 @@
 import * as AWS from "@/AWS";
 import { makeS3State } from "@/AWS";
+import { AWSEnvironment } from "@/AWS/Environment.ts";
+import { createStateBucketName } from "@/AWS/StateStore/State.ts";
 import type { ResourceState, StateService } from "@/State";
 import * as Test from "@/Test/Alchemy";
+import * as s3 from "@distilled.cloud/aws/s3";
 import { expect } from "alchemy-test";
 import * as Effect from "effect/Effect";
+import * as Redacted from "effect/Redacted";
+import * as Result from "effect/Result";
+import * as Stream from "effect/Stream";
 
 const { test } = Test.make({ providers: AWS.providers() });
 
@@ -104,6 +110,136 @@ test.provider(
 
         yield* state.deleteStack({ stack: STACK, stage });
         expect(yield* state.getOutput({ stack: STACK, stage })).toBeUndefined();
+      }).pipe(Effect.ensuring(cleanStage(state, stage)));
+    }),
+  { timeout: 120_000 },
+);
+
+/**
+ * Deterministic parameter name for the test key. Deliberately left in
+ * place across runs (standard-tier SecureString parameters are free)
+ * so every run reuses the same key, mirroring real usage.
+ */
+const SECRETS_PARAM = "/alchemy/test/state-store/secrets-key";
+
+/** Read the raw (undecrypted) state object bytes out of the bucket. */
+const readRawObject = (key: string) =>
+  Effect.gen(function* () {
+    const { accountId, region } = yield* AWSEnvironment.current;
+    const bucket = createStateBucketName(accountId, region);
+    const result = yield* s3.getObject({ Bucket: bucket, Key: key });
+    return result.Body === undefined
+      ? ""
+      : yield* Stream.mkString(Stream.decodeText(result.Body));
+  });
+
+test.provider(
+  "ssm secrets tier encrypts Redacted values at rest",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* makeS3State({
+        prefix: "test-state",
+        secrets: { kind: "ssm", parameterName: SECRETS_PARAM },
+      });
+      const stage = "secrets-ssm";
+
+      yield* state.deleteStack({ stack: STACK, stage });
+
+      yield* Effect.gen(function* () {
+        const secret = "s3cret-token-value";
+        const a = resource("SecretResource", {
+          token: Redacted.make(secret),
+          plain: "visible",
+        });
+        yield* state.set({ stack: STACK, stage, fqn: a.fqn, value: a });
+
+        // Round-trip: the Redacted value survives with its wrapper.
+        const got = (yield* state.get({
+          stack: STACK,
+          stage,
+          fqn: a.fqn,
+        })) as ResourceState & { attr: { token: unknown; plain: string } };
+        expect(Redacted.isRedacted(got.attr.token)).toBe(true);
+        expect(
+          Redacted.value(got.attr.token as Redacted.Redacted<string>),
+        ).toBe(secret);
+        expect(got.attr.plain).toBe("visible");
+
+        // Out-of-band: the raw S3 object holds ciphertext for the
+        // secret while the rest of the state stays readable JSON.
+        const raw = yield* readRawObject(
+          `test-state/${STACK}/${stage}/SecretResource.json`,
+        );
+        expect(raw).not.toContain(secret);
+        expect(raw).not.toContain("__redacted__");
+        expect(raw).toContain("__secret__");
+        expect(raw).toContain("visible");
+
+        // Legacy plaintext entries written before encryption was
+        // enabled still read through the encrypting store unchanged.
+        const plaintextStore = yield* makeS3State({ prefix: "test-state" });
+        const b = resource("LegacyResource", { token: Redacted.make(secret) });
+        yield* plaintextStore.set({
+          stack: STACK,
+          stage,
+          fqn: b.fqn,
+          value: b,
+        });
+        const legacy = (yield* state.get({
+          stack: STACK,
+          stage,
+          fqn: b.fqn,
+        })) as ResourceState & { attr: { token: Redacted.Redacted<string> } };
+        expect(Redacted.value(legacy.attr.token)).toBe(secret);
+
+        // A plaintext-configured store refuses to surface ciphertext.
+        const failed = yield* Effect.result(
+          plaintextStore.get({ stack: STACK, stage, fqn: a.fqn }),
+        );
+        expect(Result.isFailure(failed)).toBe(true);
+      }).pipe(Effect.ensuring(cleanStage(state, stage)));
+    }),
+  { timeout: 120_000 },
+);
+
+/**
+ * KMS lifecycle is gated on a caller-supplied key: auto-provisioning a
+ * customer-managed key in tests would accumulate $1/month CMKs that
+ * take 7+ days of scheduled deletion to reclaim. Set
+ * `AWS_TEST_STATE_KMS_KEY_ID` (a key ID, ARN, or alias) to run it.
+ */
+test.provider.skipIf(!process.env.AWS_TEST_STATE_KMS_KEY_ID)(
+  "kms secrets tier encrypts Redacted values at rest",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* makeS3State({
+        prefix: "test-state",
+        secrets: {
+          kind: "kms",
+          keyId: process.env.AWS_TEST_STATE_KMS_KEY_ID,
+        },
+      });
+      const stage = "secrets-kms";
+
+      yield* state.deleteStack({ stack: STACK, stage });
+
+      yield* Effect.gen(function* () {
+        const secret = "kms-s3cret-token-value";
+        const a = resource("SecretResource", { token: Redacted.make(secret) });
+        yield* state.set({ stack: STACK, stage, fqn: a.fqn, value: a });
+
+        const got = (yield* state.get({
+          stack: STACK,
+          stage,
+          fqn: a.fqn,
+        })) as ResourceState & { attr: { token: Redacted.Redacted<string> } };
+        expect(Redacted.value(got.attr.token)).toBe(secret);
+
+        const raw = yield* readRawObject(
+          `test-state/${STACK}/${stage}/SecretResource.json`,
+        );
+        expect(raw).not.toContain(secret);
+        expect(raw).toContain("__secret__");
       }).pipe(Effect.ensuring(cleanStage(state, stage)));
     }),
   { timeout: 120_000 },

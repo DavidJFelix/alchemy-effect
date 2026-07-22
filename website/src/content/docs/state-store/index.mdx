@@ -118,6 +118,63 @@ you want a dedicated store per Cloudflare account or per team:
 state: Cloudflare.state({ workerName: "alchemy-state-store-team-a" }),
 ```
 
+## AWS state store
+
+`AWS.state()` persists state as JSON objects in an account-regional
+S3 bucket (`alchemy-state-{accountId}-{region}-an`), created lazily
+on first use. There is no deployed compute and no bootstrap step —
+the CLI talks to S3 directly with your IAM credentials, so passive
+cost is effectively zero.
+
+```typescript
+Alchemy.Stack(
+  "MyApp",
+  {
+    providers: AWS.providers(),
+    state: AWS.state(),
+  },
+  Effect.gen(function* () {
+    // ...
+  }),
+);
+```
+
+Pass `bucketName` and/or `prefix` to use a shared company bucket
+instead of the default.
+
+### Encrypting secrets at rest
+
+Resource state can embed secrets (API tokens, connection strings).
+The `secrets` option tiers how those `Redacted` fields are persisted
+— non-secret state always stays readable plaintext JSON:
+
+| Tier                    | Secret fields                                                           | Passive cost |
+| ----------------------- | ----------------------------------------------------------------------- | ------------ |
+| `{ kind: "plaintext" }` | Plaintext JSON (default; anyone with bucket read access can read them)  | $0           |
+| `{ kind: "ssm" }`       | AES-256-GCM, key auto-created in an SSM `SecureString` parameter        | $0           |
+| `{ kind: "kms" }`       | `kms:Encrypt` per secret against a customer-managed key                 | ~$1/month    |
+
+```typescript
+state: AWS.state({ secrets: { kind: "ssm" } }),
+```
+
+With `ssm`, a random 256-bit key is generated once into
+`/alchemy/state-store/secrets-key` and secret values are encrypted
+client-side before they reach S3 — reading a secret then requires
+both bucket access _and_ `ssm:GetParameter` on the key parameter.
+
+With `kms`, every decrypt is individually authorized and
+CloudTrail-audited. Omit `keyId` to auto-provision a customer-managed
+key under `alias/alchemy-state-store`, or bring your own:
+
+```typescript
+state: AWS.state({ secrets: { kind: "kms", keyId: "alias/my-state-key" } }),
+```
+
+Reads accept all tiers simultaneously, so enabling encryption on an
+existing store upgrades entries as they are rewritten — no migration
+step.
+
 ## State and lifecycle
 
 State transitions track the lifecycle of each resource:

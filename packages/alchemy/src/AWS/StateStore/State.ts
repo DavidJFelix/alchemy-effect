@@ -15,7 +15,10 @@ import {
   type PersistedState,
   type StateService,
 } from "../../State/State.ts";
-import { encodeState, reviveState } from "../../State/StateEncoding.ts";
+import {
+  encodeState,
+  reviveStateRecursive,
+} from "../../State/StateEncoding.ts";
 import { recordStateStoreInit } from "../../Telemetry/Metrics.ts";
 import { AwsAuth } from "../AuthProvider.ts";
 import * as AwsCredentials from "../Credentials.ts";
@@ -25,6 +28,12 @@ import {
   Default as DefaultEnvironment,
 } from "../Environment.ts";
 import * as AwsRegion from "../Region.ts";
+import {
+  decryptStateSecrets,
+  encryptStateSecrets,
+  makeSecretsCodec,
+  type StateSecretsOptions,
+} from "./Secrets.ts";
 
 /**
  * The bookkeeping object that stores a stack's resolved output. Lives
@@ -55,6 +64,27 @@ export interface S3StateOptions {
    * @default "" (bucket root)
    */
   prefix?: string;
+  /**
+   * How `Redacted` secret values inside resource state are persisted.
+   * Non-secret state is always stored as readable plaintext JSON; this
+   * option only tiers the secret fields:
+   *
+   * - `{ kind: "plaintext" }` — secrets stored as plaintext JSON
+   *   (readable by anyone with bucket read access).
+   * - `{ kind: "ssm" }` — secrets encrypted client-side with
+   *   AES-256-GCM using a random key auto-created in a free SSM
+   *   `SecureString` parameter.
+   * - `{ kind: "kms" }` — each secret encrypted via `kms:Encrypt`
+   *   against a customer-managed key (auto-provisioned under
+   *   `alias/alchemy-state-store` when `keyId` is omitted; ~$1/month).
+   *
+   * Reads accept all forms simultaneously, so enabling encryption on an
+   * existing store upgrades entries as they are rewritten — no
+   * migration step.
+   *
+   * @default { kind: "plaintext" }
+   */
+  secrets?: StateSecretsOptions;
 }
 
 /** Context required by the distilled S3 operations. */
@@ -114,6 +144,52 @@ type S3Deps = Credentials | HttpClient | Region;
  *   }),
  * );
  * ```
+ *
+ * @section Encrypting secrets at rest
+ * Resource state can embed secrets (API tokens, connection strings).
+ * By default they are stored as plaintext JSON, readable by anyone
+ * with bucket read access. The `secrets` option encrypts just the
+ * secret fields — the rest of the state stays readable JSON — so
+ * reading a secret requires both bucket access *and* access to the
+ * key material.
+ *
+ * @example Encrypt secrets with a key in SSM Parameter Store (free)
+ * A random 256-bit AES key is created once in an SSM `SecureString`
+ * parameter (`/alchemy/state-store/secrets-key`); secret values are
+ * encrypted client-side with AES-256-GCM before they reach S3.
+ * ```typescript
+ * const Stack = Alchemy.Stack(
+ *   "my-stack",
+ *   {
+ *     providers: AWS.providers(),
+ *     state: AWS.state({ secrets: { kind: "ssm" } }),
+ *   },
+ *   Effect.gen(function* () {
+ *     // ...
+ *   }),
+ * );
+ * ```
+ *
+ * @example Encrypt secrets with KMS
+ * Each secret is encrypted via `kms:Encrypt`, so every decrypt is
+ * individually authorized and CloudTrail-audited. Omit `keyId` to
+ * auto-provision a customer-managed key under
+ * `alias/alchemy-state-store` (~$1/month), or pass your own key ID,
+ * ARN, or alias.
+ * ```typescript
+ * const Stack = Alchemy.Stack(
+ *   "my-stack",
+ *   {
+ *     providers: AWS.providers(),
+ *     state: AWS.state({
+ *       secrets: { kind: "kms", keyId: "alias/my-state-key" },
+ *     }),
+ *   },
+ *   Effect.gen(function* () {
+ *     // ...
+ *   }),
+ * );
+ * ```
  */
 export const state = (options: S3StateOptions = {}) =>
   Layer.effect(
@@ -155,13 +231,22 @@ export const makeS3State = (options: S3StateOptions = {}) =>
       : "";
 
     const toError = (cause: unknown) =>
-      new StateStoreError({
-        message:
-          cause instanceof Error
-            ? cause.message
-            : `S3 state store error: ${String(cause)}`,
-        cause: cause instanceof Error ? cause : undefined,
-      });
+      cause instanceof StateStoreError
+        ? cause
+        : new StateStoreError({
+            message:
+              cause instanceof Error
+                ? cause.message
+                : `S3 state store error: ${String(cause)}`,
+            cause: cause instanceof Error ? cause : undefined,
+          });
+
+    // Secrets tier (see StateSecretsOptions). Construction only
+    // allocates the lazy key cache — nothing touches AWS until the
+    // first secret is actually encrypted or decrypted.
+    const codec = yield* makeSecretsCodec(
+      options.secrets ?? { kind: "plaintext" },
+    );
 
     // Anything that touches AWS credentials must NOT run at layer
     // construction time. Resolving the environment (account/region),
@@ -244,7 +329,7 @@ export const makeS3State = (options: S3StateOptions = {}) =>
             : Stream.mkString(Stream.decodeText(result.Body)).pipe(
                 Effect.flatMap((text) =>
                   Effect.try({
-                    try: () => JSON.parse(text, reviveState) as T,
+                    try: () => JSON.parse(text) as unknown,
                     catch: (cause) =>
                       new StateStoreError({
                         message: `Failed to parse state object '${key}'`,
@@ -252,18 +337,24 @@ export const makeS3State = (options: S3StateOptions = {}) =>
                       }),
                   }),
                 ),
+                Effect.flatMap((raw) => decryptStateSecrets(raw, codec)),
+                Effect.map((decoded) => reviveStateRecursive(decoded) as T),
               ),
         ),
         Effect.catchTag("NoSuchKey", () => Effect.succeed(undefined)),
       );
 
     const writeJson = (bucket: string, key: string, value: unknown) =>
-      s3.putObject({
-        Bucket: bucket,
-        Key: key,
-        Body: JSON.stringify(encodeState(value), null, 2),
-        ContentType: "application/json",
-      });
+      encryptStateSecrets(encodeState(value), codec).pipe(
+        Effect.flatMap((payload) =>
+          s3.putObject({
+            Bucket: bucket,
+            Key: key,
+            Body: JSON.stringify(payload, null, 2),
+            ContentType: "application/json",
+          }),
+        ),
+      );
 
     /** Delete every object under `keyPrefix` in batches. Idempotent. */
     const deleteAll = (bucket: string, keyPrefix: string) =>
